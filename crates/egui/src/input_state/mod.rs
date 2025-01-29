@@ -261,6 +261,9 @@ pub struct InputState {
     /// The safe area insets, subtracted from the `viewport_rect` in [`Self::content_rect`].
     safe_area_insets: SafeAreaInsets,
 
+    /// Previous position and size of the egui area.
+    previous_screen_rect: Rect,
+
     /// Also known as device pixel ratio, > 1 for high resolution screens.
     pub pixels_per_point: f32,
 
@@ -345,6 +348,8 @@ impl Default for InputState {
 
             viewport_rect: Rect::from_min_size(Default::default(), vec2(10_000.0, 10_000.0)),
             safe_area_insets: Default::default(),
+            previous_screen_rect: Rect::from_min_size(Default::default(), vec2(10_000.0, 10_000.0)),
+
             pixels_per_point: 1.0,
             max_texture_side: 2048,
             time: 0.0,
@@ -384,6 +389,7 @@ impl InputState {
 
         let safe_area_insets = new.safe_area_insets.unwrap_or(self.safe_area_insets);
         let viewport_rect = new.screen_rect.unwrap_or(self.viewport_rect);
+        let previous_screen_rect = self.viewport_rect;
         self.create_touch_states_for_new_devices(&new.events);
         for touch_state in self.touch_states.values_mut() {
             touch_state.begin_pass(time, &new, self.pointer.interact_pos);
@@ -473,6 +479,7 @@ impl InputState {
 
             viewport_rect,
             safe_area_insets,
+            previous_screen_rect,
             pixels_per_point,
             max_texture_side: new.max_texture_side.unwrap_or(self.max_texture_side),
             time,
@@ -552,6 +559,11 @@ impl InputState {
     /// at the end of the frame this will be zero if a scroll-area consumed the delta.
     pub fn smooth_scroll_delta(&self) -> Vec2 {
         self.smooth_scroll_delta
+    }
+
+    #[inline(always)]
+    pub fn screen_rect_changed(&self) -> bool {
+        self.viewport_rect != self.previous_screen_rect
     }
 
     /// Uniform zoom scale factor this frame (e.g. from ctrl-scroll or pinch gesture).
@@ -1538,6 +1550,7 @@ impl InputState {
             zoom_factor_delta,
             viewport_rect,
             safe_area_insets,
+            previous_screen_rect,
             pixels_per_point,
             max_texture_side,
             time,
@@ -1581,6 +1594,9 @@ impl InputState {
 
         ui.label(format!("viewport_rect: {viewport_rect:?} points"));
         ui.label(format!("safe_area_insets: {safe_area_insets:?} points"));
+        ui.label(format!(
+            "previous_screen_rect: {previous_screen_rect:?} points"
+        ));
         ui.label(format!(
             "{pixels_per_point} physical pixels for each logical point"
         ));
