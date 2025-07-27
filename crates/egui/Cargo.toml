@@ -70,6 +70,7 @@ _override_unity = ["epaint/_override_unity"]
 [dependencies]
 emath = { workspace = true, default-features = false }
 epaint = { workspace = true, default-features = false }
+similar = "2.7.0"
 
 accesskit.workspace = true
 ahash.workspace = true
