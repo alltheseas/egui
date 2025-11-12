@@ -4,7 +4,9 @@ use emath::{Align, GuiRounding as _, NumExt as _, Pos2, Rect, Vec2, pos2, vec2};
 
 use crate::{Color32, Mesh, Stroke, Vertex, stroke::PathStroke, text::font::Font};
 
-use super::{FontsImpl, Galley, Glyph, LayoutJob, LayoutSection, PlacedRow, Row, RowVisuals};
+use super::{
+    FontsImpl, Galley, Glyph, GlyphColoring, LayoutJob, LayoutSection, PlacedRow, Row, RowVisuals,
+};
 
 // ----------------------------------------------------------------------------
 
@@ -183,6 +185,7 @@ fn layout_section(
                 font_height: font.row_height(),
                 font_ascent: font.ascent(),
                 uv_rect: glyph_info.uv_rect,
+                coloring: glyph_info.coloring,
                 section_index,
             });
 
@@ -451,6 +454,7 @@ fn replace_last_glyph_with_overflow_character(
             font_height: font.row_height(),
             font_ascent: font.ascent(),
             uv_rect: replacement_glyph_info.uv_rect,
+            coloring: replacement_glyph_info.coloring,
             section_index,
         });
     } else {
@@ -473,6 +477,7 @@ fn replace_last_glyph_with_overflow_character(
             font_height: font.row_height(),
             font_ascent: font.ascent(),
             uv_rect: replacement_glyph_info.uv_rect,
+            coloring: replacement_glyph_info.coloring,
             section_index,
         });
     }
@@ -517,6 +522,7 @@ fn replace_last_glyph_with_overflow_character(
             last_glyph.font_impl_ascent = font_impl.map_or(0.0, |f| f.ascent());
             last_glyph.font_impl_height = font_impl.map_or(0.0, |f| f.row_height());
             last_glyph.uv_rect = glyph_info.uv_rect;
+            last_glyph.coloring = glyph_info.coloring;
 
             // Reapply kerning:
             last_glyph.pos.x += extra_letter_spacing;
@@ -539,6 +545,7 @@ fn replace_last_glyph_with_overflow_character(
             last_glyph.font_impl_ascent = font_impl.map_or(0.0, |f| f.ascent());
             last_glyph.font_impl_height = font_impl.map_or(0.0, |f| f.row_height());
             last_glyph.uv_rect = glyph_info.uv_rect;
+            last_glyph.coloring = glyph_info.coloring;
             return;
         }
     }
@@ -856,8 +863,12 @@ fn tessellate_glyphs(point_scale: PointScale, job: &LayoutJob, row: &Row, mesh: 
             );
 
             let format = &job.sections[glyph.section_index as usize].format;
+            let mut color = format.color;
 
-            let color = format.color;
+            if matches!(glyph.coloring, GlyphColoring::Color) {
+                // Emoji sprites already contain baked RGBA values, so use white to keep them vibrant.
+                color = Color32::WHITE;
+            }
 
             if format.italics {
                 let idx = mesh.vertices.len() as u32;

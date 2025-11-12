@@ -9,6 +9,8 @@ use crate::{
     text::FontTweak,
 };
 
+use super::emoji::EmojiStore;
+
 // ----------------------------------------------------------------------------
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -34,6 +36,15 @@ impl UvRect {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+pub enum GlyphColoring {
+    /// Standard glyphs are monochrome and should be multiplied with the widget's chosen text color.
+    Monochrome,
+    /// Emoji glyphs already contain color data and must bypass tinting.
+    Color,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct GlyphInfo {
     /// Used for pair-kerning.
@@ -47,6 +58,9 @@ pub struct GlyphInfo {
 
     /// Texture coordinates.
     pub uv_rect: UvRect,
+
+    /// Whether this glyph carries baked colors or not.
+    pub coloring: GlyphColoring,
 }
 
 impl Default for GlyphInfo {
@@ -56,6 +70,7 @@ impl Default for GlyphInfo {
             id: ab_glyph::GlyphId(0),
             advance_width: 0.0,
             uv_rect: Default::default(),
+            coloring: GlyphColoring::Monochrome,
         }
     }
 }
@@ -261,7 +276,7 @@ impl FontImpl {
         self.ascent
     }
 
-    pub fn allocate_custom_glyph(&self, c: char, image: ColorImage) -> GlyphInfo {
+    pub fn allocate_custom_glyph(&self, _c: char, image: &ColorImage) -> GlyphInfo {
         let glyph_pos = {
             let atlas = &mut self.atlas.lock();
             let (glyph_pos, atlas_image) = atlas.allocate((image.width(), image.height()));
@@ -299,8 +314,9 @@ impl FontImpl {
 
         GlyphInfo {
             id: ab_glyph::GlyphId(0),
-            advance_width: advance_width as f32,
+            advance_width,
             uv_rect,
+            coloring: GlyphColoring::Color,
         }
     }
 
@@ -360,6 +376,7 @@ impl FontImpl {
             id: glyph_id,
             advance_width: advance_width_in_points,
             uv_rect,
+            coloring: GlyphColoring::Monochrome,
         }
     }
 }
@@ -429,13 +446,31 @@ impl Font {
         }
     }
 
-    pub fn allocate_custom_glyph(&mut self, c: char, image: ColorImage) -> GlyphInfo {
+    /// Insert a user-provided glyph into the atlas.
+    pub fn allocate_custom_glyph(&mut self, c: char, image: &ColorImage) -> GlyphInfo {
         if let Some(font_impl) = self.fonts.first() {
             let glyph_info = font_impl.allocate_custom_glyph(c, image);
             self.glyph_info_cache.insert(c, (0, glyph_info));
             glyph_info
         } else {
             GlyphInfo::default()
+        }
+    }
+
+    pub(crate) fn preload_emojis(&mut self, store: &EmojiStore) {
+        if self.fonts.is_empty() || store.is_empty() {
+            return;
+        }
+
+        // We piggyback on the primary font's atlas allocation so emoji glyphs are available
+        // without requiring app-side setup.
+        for entry in store.entries() {
+            if self.glyph_info_cache.contains_key(&entry.ch) {
+                continue;
+            }
+
+            let glyph_info = self.fonts[0].allocate_custom_glyph(entry.ch, entry.image());
+            self.glyph_info_cache.insert(entry.ch, (0, glyph_info));
         }
     }
 
