@@ -13,6 +13,14 @@ This is just the changelog for the core `egui` crate. Every crate in this reposi
 This file is updated upon each release.
 Changes since the last release can be found at <https://github.com/emilk/egui/compare/latest...HEAD> or by running the `scripts/generate_changelog.py` script.
 
+## Unreleased
+
+### Added
+* `Context::register_color_glyph` lets integrations and third-party crates register bitmap glyphs (for instance emoji atlases) directly on a context.
+
+### Changed
+* The built-in emoji atlas was split into the optional [`egui_noto_emoji`](crates/egui_noto_emoji) crate. Apps that want colorful emojis should add that crate and call `egui_noto_emoji::install(&ctx)` during startup.
+
 
 ## 0.32.0 - 2025-07-10 - Atoms, popups, and better SVG support
 This is a big egui release, with several exciting new features!
