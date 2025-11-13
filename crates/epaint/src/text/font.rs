@@ -465,6 +465,10 @@ impl Font {
         // We piggyback on the primary font's atlas allocation so emoji glyphs are available
         // without requiring app-side setup.
         for entry in store.entries() {
+            if is_keycap_component(entry.ch) {
+                continue; // Don't override ASCII digits/#/* with emoji sprites.
+            }
+
             if self.glyph_info_cache.contains_key(&entry.ch) {
                 continue;
             }
@@ -572,6 +576,12 @@ impl Font {
         }
         None
     }
+}
+
+/// Single ASCII characters that are part of the keycap emoji sequences.
+/// Those sequences require multiple code points, so keep the plain glyphs rendered by the base fonts.
+fn is_keycap_component(c: char) -> bool {
+    matches!(c, '#' | '*' | '0'..='9')
 }
 
 /// Code points that will always be invisible (zero width).
