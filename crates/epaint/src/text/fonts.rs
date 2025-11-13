@@ -1,7 +1,7 @@
 use std::{collections::BTreeMap, sync::Arc};
 
 use crate::{
-    AlphaFromCoverage, TextureAtlas,
+    AlphaFromCoverage, ColorImage, TextureAtlas,
     mutex::{Mutex, MutexGuard},
     text::{
         Galley, LayoutJob, LayoutSection,
@@ -517,6 +517,14 @@ impl Fonts {
         self.lock().fonts.atlas.clone()
     }
 
+    /// Register a pre-rendered glyph (with baked colors) so every sized font can render it.
+    ///
+    /// This is the building block for opt-in emoji packs or any other bitmap glyph source.
+    pub fn register_color_glyph(&self, character: char, image: Arc<ColorImage>) {
+        let mut fonts_and_cache = self.0.lock();
+        fonts_and_cache.fonts.register_color_glyph(character, image);
+    }
+
     /// The full font atlas image.
     #[inline]
     pub fn image(&self) -> crate::ColorImage {
@@ -656,6 +664,7 @@ pub struct FontsImpl {
     atlas: Arc<Mutex<TextureAtlas>>,
     font_impl_cache: FontImplCache,
     sized_family: ahash::HashMap<(OrderedFloat<f32>, FontFamily), Font>,
+    color_glyphs: BTreeMap<char, Arc<ColorImage>>,
     emoji_store: EmojiStore,
 }
 
@@ -690,6 +699,7 @@ impl FontsImpl {
             atlas,
             font_impl_cache,
             sized_family: Default::default(),
+            color_glyphs: Default::default(),
             emoji_store,
         }
     }
@@ -697,6 +707,14 @@ impl FontsImpl {
     #[inline(always)]
     pub fn pixels_per_point(&self) -> f32 {
         self.pixels_per_point
+    }
+
+    /// Remember a color glyph so it can be replayed into both existing and future font atlases.
+    pub fn register_color_glyph(&mut self, character: char, image: Arc<ColorImage>) {
+        self.color_glyphs.insert(character, image.clone());
+        for font in self.sized_family.values_mut() {
+            font.register_color_glyph(character, image.clone());
+        }
     }
 
     #[inline]
@@ -724,6 +742,7 @@ impl FontsImpl {
 
                 let mut font = Font::new(fonts);
                 font.preload_emojis(&self.emoji_store);
+                font.install_color_glyphs(&self.color_glyphs);
                 font
             })
     }

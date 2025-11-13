@@ -457,6 +457,27 @@ impl Font {
         }
     }
 
+    /// Register a single color glyph (for instance an emoji sprite) in the atlas.
+    ///
+    /// This keeps the font infrastructure agnostic over where the bitmap originated.
+    pub fn register_color_glyph(&mut self, c: char, image: Arc<ColorImage>) {
+        if self.fonts.is_empty() || self.glyph_info_cache.contains_key(&c) {
+            return;
+        }
+
+        let glyph_info = self.fonts[0].allocate_custom_glyph(c, image.as_ref());
+        self.glyph_info_cache.insert(c, (0, glyph_info));
+    }
+
+    pub(crate) fn install_color_glyphs(
+        &mut self,
+        glyphs: &std::collections::BTreeMap<char, Arc<ColorImage>>,
+    ) {
+        for (ch, image) in glyphs {
+            self.register_color_glyph(*ch, image.clone());
+        }
+    }
+
     pub(crate) fn preload_emojis(&mut self, store: &EmojiStore) {
         if self.fonts.is_empty() || store.is_empty() {
             return;
@@ -469,12 +490,7 @@ impl Font {
                 continue; // Don't override ASCII digits/#/* with emoji sprites.
             }
 
-            if self.glyph_info_cache.contains_key(&entry.ch) {
-                continue;
-            }
-
-            let glyph_info = self.fonts[0].allocate_custom_glyph(entry.ch, entry.image());
-            self.glyph_info_cache.insert(entry.ch, (0, glyph_info));
+            self.register_color_glyph(entry.ch, entry.image.clone());
         }
     }
 

@@ -1,11 +1,13 @@
 #![warn(missing_docs)] // Let's keep `Context` well-documented.
 
-use std::{borrow::Cow, cell::RefCell, panic::Location, sync::Arc, time::Duration};
+use std::{
+    borrow::Cow, cell::RefCell, collections::BTreeMap, panic::Location, sync::Arc, time::Duration,
+};
 
 use emath::{GuiRounding as _, OrderedFloat};
 use epaint::{
-    ClippedPrimitive, ClippedShape, Color32, ImageData, ImageDelta, Pos2, Rect, StrokeKind,
-    TessellationOptions, TextureAtlas, TextureId, Vec2,
+    ClippedPrimitive, ClippedShape, Color32, ColorImage, ImageData, ImageDelta, Pos2, Rect,
+    StrokeKind, TessellationOptions, TextureAtlas, TextureId, Vec2,
     emath::{self, TSTransform},
     mutex::RwLock,
     stats::PaintStats,
@@ -412,6 +414,8 @@ struct ContextImpl {
     /// This is because the `Fonts` depend on `pixels_per_point` for the font atlas
     /// as well as kerning, font sizes, etc.
     fonts: std::collections::BTreeMap<OrderedFloat<f32>, Fonts>,
+    /// Registry of opt-in bitmap glyphs (e.g. emojis) that should be replayed into every font atlas.
+    color_glyphs: BTreeMap<char, Arc<ColorImage>>,
     font_definitions: FontDefinitions,
 
     memory: Memory,
@@ -454,6 +458,13 @@ struct ContextImpl {
 }
 
 impl ContextImpl {
+    fn register_color_glyph_arc(&mut self, character: char, image: Arc<ColorImage>) {
+        self.color_glyphs.insert(character, image.clone());
+        for fonts in self.fonts.values() {
+            fonts.register_color_glyph(character, image.clone());
+        }
+    }
+
     fn begin_pass(&mut self, mut new_raw_input: RawInput) {
         let viewport_id = new_raw_input.viewport_id;
         let parent_id = new_raw_input
@@ -634,6 +645,12 @@ impl ContextImpl {
         {
             profiling::scope!("Fonts::begin_pass");
             fonts.begin_pass(pixels_per_point, max_texture_side, text_alpha_from_coverage);
+        }
+
+        if is_new {
+            for (&character, image) in &self.color_glyphs {
+                fonts.register_color_glyph(character, image.clone());
+            }
         }
 
         if is_new && self.memory.options.preload_font_glyphs {
@@ -1955,6 +1972,20 @@ impl Context {
         if update_fonts {
             self.memory_mut(|mem| mem.add_fonts.push(new_font));
         }
+    }
+
+    /// Register a bitmap glyph (such as an emoji sprite) that should be rendered verbatim whenever
+    /// the given character appears in text.
+    ///
+    /// Call this during initialization, before you start queuing lots of text, to avoid
+    /// unnecessary atlas churn.
+    pub fn register_color_glyph(&self, character: char, image: crate::ColorImage) {
+        self.register_color_glyph_arc(character, Arc::new(image));
+    }
+
+    /// Same as [`Self::register_color_glyph`], but lets you share the underlying image allocation.
+    pub fn register_color_glyph_arc(&self, character: char, image: Arc<crate::ColorImage>) {
+        self.write(|ctx| ctx.register_color_glyph_arc(character, image));
     }
 
     /// Does the OS use dark or light mode?
