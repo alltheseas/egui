@@ -10,8 +10,6 @@ use crate::{
 };
 use emath::{NumExt as _, OrderedFloat};
 
-use super::EmojiStore;
-
 #[cfg(feature = "default_fonts")]
 use epaint_default_fonts::{EMOJI_ICON, HACK_REGULAR, NOTO_EMOJI_REGULAR, UBUNTU_LIGHT};
 
@@ -665,7 +663,6 @@ pub struct FontsImpl {
     font_impl_cache: FontImplCache,
     sized_family: ahash::HashMap<(OrderedFloat<f32>, FontFamily), Font>,
     color_glyphs: BTreeMap<char, Arc<ColorImage>>,
-    emoji_store: EmojiStore,
 }
 
 impl FontsImpl {
@@ -690,8 +687,6 @@ impl FontsImpl {
 
         let font_impl_cache =
             FontImplCache::new(atlas.clone(), pixels_per_point, &definitions.font_data);
-        let emoji_store = EmojiStore::builtin();
-
         Self {
             pixels_per_point,
             max_texture_side,
@@ -700,7 +695,6 @@ impl FontsImpl {
             font_impl_cache,
             sized_family: Default::default(),
             color_glyphs: Default::default(),
-            emoji_store,
         }
     }
 
@@ -741,7 +735,6 @@ impl FontsImpl {
                     .collect();
 
                 let mut font = Font::new(fonts);
-                font.preload_emojis(&self.emoji_store);
                 font.install_color_glyphs(&self.color_glyphs);
                 font
             })

@@ -9,8 +9,6 @@ use crate::{
     text::FontTweak,
 };
 
-use super::emoji::EmojiStore;
-
 // ----------------------------------------------------------------------------
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -478,22 +476,6 @@ impl Font {
         }
     }
 
-    pub(crate) fn preload_emojis(&mut self, store: &EmojiStore) {
-        if self.fonts.is_empty() || store.is_empty() {
-            return;
-        }
-
-        // We piggyback on the primary font's atlas allocation so emoji glyphs are available
-        // without requiring app-side setup.
-        for entry in store.entries() {
-            if is_keycap_component(entry.ch) {
-                continue; // Don't override ASCII digits/#/* with emoji sprites.
-            }
-
-            self.register_color_glyph(entry.ch, entry.image.clone());
-        }
-    }
-
     pub fn preload_common_characters(&mut self) {
         // Preload the printable ASCII characters [32, 126] (which excludes control codes):
         const FIRST_ASCII: usize = 32; // 32 == space
@@ -592,12 +574,6 @@ impl Font {
         }
         None
     }
-}
-
-/// Single ASCII characters that are part of the keycap emoji sequences.
-/// Those sequences require multiple code points, so keep the plain glyphs rendered by the base fonts.
-fn is_keycap_component(c: char) -> bool {
-    matches!(c, '#' | '*' | '0'..='9')
 }
 
 /// Code points that will always be invisible (zero width).
