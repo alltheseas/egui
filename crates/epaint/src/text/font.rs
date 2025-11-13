@@ -459,8 +459,14 @@ impl Font {
     ///
     /// This keeps the font infrastructure agnostic over where the bitmap originated.
     pub fn register_color_glyph(&mut self, c: char, image: Arc<ColorImage>) {
-        if self.fonts.is_empty() || self.glyph_info_cache.contains_key(&c) {
+        if self.fonts.is_empty() {
             return;
+        }
+
+        if let Some((_font_index, glyph)) = self.glyph_info_cache.get(&c) {
+            if matches!(glyph.coloring, GlyphColoring::Color) {
+                return; // `c` already has a color sprite.
+            }
         }
 
         let glyph_info = self.fonts[0].allocate_custom_glyph(c, image.as_ref());
