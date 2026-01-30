@@ -7,10 +7,11 @@ use skrifa::{
     raw::{TableProvider as _, tables::kern::SubtableKind},
 };
 use std::collections::BTreeMap;
+use std::sync::Arc;
 use vello_cpu::{color, kurbo};
 
 use crate::{
-    TextOptions, TextureAtlas,
+    ColorImage, TextOptions, TextureAtlas,
     text::{
         FontTweak,
         fonts::{Blob, CachedFamily, FontFaceKey},
@@ -18,6 +19,13 @@ use crate::{
 };
 
 // ----------------------------------------------------------------------------
+
+/// Canonical units-per-em for custom glyphs (e.g., emoji).
+///
+/// Custom glyphs use a fixed UPEM to ensure consistent advance width
+/// regardless of which font family they appear in. This avoids layout
+/// issues when fonts have different UPEM values.
+const CUSTOM_GLYPH_UPEM: f32 = 1000.0;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
@@ -42,6 +50,25 @@ impl UvRect {
     }
 }
 
+/// Whether a glyph carries baked color data or should be tinted.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+pub enum GlyphColoring {
+    /// Standard glyphs are monochrome and should be multiplied with the widget's chosen text color.
+    #[default]
+    Monochrome,
+
+    /// Color glyphs (e.g., emoji) already contain color data and must bypass tinting.
+    Color,
+}
+
+type CustomGlyphIndex = u32;
+
+#[derive(Clone)]
+struct CustomGlyph {
+    image: Arc<ColorImage>,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct GlyphInfo {
     /// Used for pair-kerning.
@@ -53,6 +80,12 @@ pub struct GlyphInfo {
 
     /// In [`skrifa`]s "unscaled" coordinate system.
     pub advance_width_unscaled: OrderedFloat<f32>,
+
+    /// Optional index into a user-provided color glyph registry.
+    pub(crate) custom_glyph: Option<CustomGlyphIndex>,
+
+    /// Whether this glyph carries baked color.
+    pub coloring: GlyphColoring,
 }
 
 impl GlyphInfo {
@@ -60,7 +93,19 @@ impl GlyphInfo {
     pub const INVISIBLE: Self = Self {
         id: None,
         advance_width_unscaled: OrderedFloat(0.0),
+        custom_glyph: None,
+        coloring: GlyphColoring::Monochrome,
     };
+
+    fn cache_hash(&self) -> u64 {
+        if let Some(id) = self.id {
+            id.to_u32() as u64
+        } else if let Some(custom) = self.custom_glyph {
+            (1u64 << 32) | custom as u64
+        } else {
+            0
+        }
+    }
 }
 
 // Subpixel binning, taken from cosmic-text:
@@ -137,6 +182,9 @@ pub struct GlyphAllocation {
 
     /// UV rectangle for drawing.
     pub uv_rect: UvRect,
+
+    /// Whether the glyph carries baked color.
+    pub coloring: GlyphColoring,
 }
 
 #[derive(Hash, PartialEq, Eq)]
@@ -145,7 +193,7 @@ struct GlyphCacheKey(u64);
 impl nohash_hasher::IsEnabled for GlyphCacheKey {}
 
 impl GlyphCacheKey {
-    fn new(glyph_id: skrifa::GlyphId, metrics: &ScaledMetrics, bin: SubpixelBin) -> Self {
+    fn new(glyph_hash: u64, metrics: &ScaledMetrics, bin: SubpixelBin) -> Self {
         let ScaledMetrics {
             pixels_per_point,
             px_scale_factor,
@@ -160,7 +208,7 @@ impl GlyphCacheKey {
             "Bad px_scale_factor: {px_scale_factor}"
         );
         Self(crate::util::hash((
-            glyph_id,
+            glyph_hash,
             pixels_per_point.to_bits(),
             px_scale_factor.to_bits(),
             bin,
@@ -292,6 +340,7 @@ impl FontCell {
             id: glyph_id,
             advance_width_px: glyph_info.advance_width_unscaled.0 * metrics.px_scale_factor,
             uv_rect,
+            coloring: GlyphColoring::Monochrome,
         })
     }
 }
@@ -341,6 +390,12 @@ pub struct FontFace {
     location: skrifa::instance::Location,
     glyph_info_cache: ahash::HashMap<char, GlyphInfo>,
     glyph_alloc_cache: ahash::HashMap<GlyphCacheKey, GlyphAllocation>,
+
+    /// Maps characters to custom glyph indices.
+    custom_glyph_map: ahash::HashMap<char, CustomGlyphIndex>,
+
+    /// User-provided color glyph images (e.g., emoji sprites).
+    custom_glyphs: Vec<CustomGlyph>,
 }
 
 impl FontFace {
@@ -436,7 +491,17 @@ impl FontFace {
             location,
             glyph_info_cache: Default::default(),
             glyph_alloc_cache: Default::default(),
+            custom_glyph_map: Default::default(),
+            custom_glyphs: Vec::new(),
         })
+    }
+
+    /// Clear the glyph allocation cache.
+    ///
+    /// Called when central custom glyphs are re-registered to ensure stale
+    /// atlas allocations aren't reused.
+    pub(super) fn clear_glyph_alloc_cache(&mut self) {
+        self.glyph_alloc_cache.clear();
     }
 
     /// Code points that will always be replaced by the replacement character.
@@ -466,6 +531,7 @@ impl FontFace {
             .charmap
             .mappings()
             .filter_map(|(chr, _)| char::from_u32(chr).filter(|c| !self.ignore_character(*c)))
+            .chain(self.custom_glyph_map.keys().copied())
     }
 
     /// `\n` will result in `None`
@@ -514,6 +580,20 @@ impl FontFace {
             return Some(glyph_info);
         }
 
+        // Check for custom glyph (e.g., color emoji)
+        if let Some(&custom_index) = self.custom_glyph_map.get(&c) {
+            let glyph_info = GlyphInfo {
+                id: None,
+                advance_width_unscaled: OrderedFloat(
+                    self.font.borrow_dependent().metrics.units_per_em as f32,
+                ),
+                custom_glyph: Some(custom_index),
+                coloring: GlyphColoring::Color,
+            };
+            self.glyph_info_cache.insert(c, glyph_info);
+            return Some(glyph_info);
+        }
+
         let font_data = self.font.borrow_dependent();
 
         // Add new character:
@@ -529,9 +609,51 @@ impl FontFace {
                 .advance_width(glyph_id)
                 .unwrap_or_default()
                 .into(),
+            custom_glyph: None,
+            coloring: GlyphColoring::Monochrome,
         };
         self.glyph_info_cache.insert(c, glyph_info);
         Some(glyph_info)
+    }
+
+    /// Register a color glyph image, sharing the underlying allocation.
+    pub fn allocate_custom_glyph_arc(&mut self, chr: char, image: &Arc<ColorImage>) -> GlyphInfo {
+        let (index, is_update) = match self.custom_glyph_map.entry(chr) {
+            std::collections::hash_map::Entry::Occupied(occ) => {
+                let idx = *occ.get();
+                if let Some(slot) = self.custom_glyphs.get_mut(idx as usize) {
+                    *slot = CustomGlyph {
+                        image: Arc::clone(image),
+                    };
+                }
+                (idx, true)
+            }
+            std::collections::hash_map::Entry::Vacant(vac) => {
+                let idx = self.custom_glyphs.len() as CustomGlyphIndex;
+                self.custom_glyphs.push(CustomGlyph {
+                    image: Arc::clone(image),
+                });
+                (*vac.insert(idx), false)
+            }
+        };
+
+        // Invalidate cached glyph info if it exists (may have been monochrome fallback)
+        self.glyph_info_cache.remove(&chr);
+
+        // When re-registering a glyph with a new image, clear allocation cache to ensure
+        // stale atlas allocations aren't reused. The cache will be repopulated on demand.
+        if is_update {
+            self.glyph_alloc_cache.clear();
+        }
+
+        GlyphInfo {
+            id: None,
+            advance_width_unscaled: OrderedFloat(
+                self.font.borrow_dependent().metrics.units_per_em as f32,
+            ),
+            custom_glyph: Some(index),
+            coloring: GlyphColoring::Color,
+        }
     }
 
     #[inline]
@@ -566,6 +688,29 @@ impl FontFace {
         self.pair_kerning_pixels(metrics, last_glyph_id, glyph_id) / metrics.pixels_per_point
     }
 
+    /// Get the width of a glyph in points, accounting for custom glyphs.
+    fn glyph_width_points(&self, glyph: &GlyphInfo, font_size: f32) -> f32 {
+        // Per-face custom glyphs (legacy path)
+        if let Some(custom_index) = glyph.custom_glyph {
+            if let Some(custom) = self.custom_glyphs.get(custom_index as usize)
+                && custom.image.height() > 0
+            {
+                let aspect = custom.image.width() as f32 / custom.image.height() as f32;
+                return font_size * aspect;
+            }
+            return 0.0;
+        }
+
+        // Central custom glyphs: coloring == Color && id.is_none()
+        // Width = font_size * (advance_width_unscaled / CUSTOM_GLYPH_UPEM)
+        // Since advance_width_unscaled = CUSTOM_GLYPH_UPEM * aspect_ratio, this gives font_size * aspect_ratio
+        if glyph.coloring == GlyphColoring::Color && glyph.id.is_none() {
+            return font_size * glyph.advance_width_unscaled.0 / CUSTOM_GLYPH_UPEM;
+        }
+
+        glyph.advance_width_unscaled.0 * self.font.px_scale_factor(font_size)
+    }
+
     #[inline(always)]
     pub fn scaled_metrics(&self, pixels_per_point: f32, font_size: f32) -> ScaledMetrics {
         let pt_scale_factor = self.font.px_scale_factor(font_size * self.tweak.scale);
@@ -598,13 +743,24 @@ impl FontFace {
         glyph_info: GlyphInfo,
         chr: char,
         h_pos: f32,
+        central_custom_glyph: Option<&super::fonts::CustomGlyphData>,
     ) -> (GlyphAllocation, i32) {
+        // Handle custom color glyphs from central storage (preferred path)
+        if let Some(custom_data) = central_custom_glyph {
+            return self.allocate_central_color_glyph(atlas, metrics, chr, custom_data, h_pos);
+        }
+
+        // Handle custom color glyphs from per-face storage (legacy path)
+        if let Some(custom_index) = glyph_info.custom_glyph {
+            return self.allocate_registered_color_glyph(atlas, metrics, custom_index, h_pos);
+        }
+
         let advance_width_px = glyph_info.advance_width_unscaled.0 * metrics.px_scale_factor;
 
-        let Some(glyph_id) = glyph_info.id else {
-            // Invisible.
+        // Check that the glyph has a valid id (not invisible)
+        if glyph_info.id.is_none() {
             return (GlyphAllocation::default(), h_pos as i32);
-        };
+        }
 
         // CJK scripts contain a lot of characters and could hog the glyph atlas if we stored 4 subpixel offsets per
         // glyph.
@@ -614,10 +770,11 @@ impl FontFace {
             SubpixelBin::new(h_pos)
         };
 
-        let entry = match self
-            .glyph_alloc_cache
-            .entry(GlyphCacheKey::new(glyph_id, metrics, bin))
-        {
+        let entry = match self.glyph_alloc_cache.entry(GlyphCacheKey::new(
+            glyph_info.cache_hash(),
+            metrics,
+            bin,
+        )) {
             std::collections::hash_map::Entry::Occupied(glyph_alloc) => {
                 let mut glyph_alloc = *glyph_alloc.get();
                 glyph_alloc.advance_width_px = advance_width_px; // Hack to get `\t` and thin space to work, since they use the same glyph id as ` ` (space).
@@ -634,6 +791,141 @@ impl FontFace {
         entry.insert(allocation);
         (allocation, h_pos_round)
     }
+
+    /// Allocate a registered color glyph in the atlas.
+    fn allocate_registered_color_glyph(
+        &mut self,
+        atlas: &mut TextureAtlas,
+        metrics: &ScaledMetrics,
+        custom_index: CustomGlyphIndex,
+        h_pos: f32,
+    ) -> (GlyphAllocation, i32) {
+        let Some(custom) = self.custom_glyphs.get(custom_index as usize) else {
+            log::warn!(
+                "FontFace::allocate_registered_color_glyph: index {custom_index} not found!"
+            );
+            return (GlyphAllocation::default(), h_pos.round() as i32);
+        };
+
+        let glyph_width = custom.image.width();
+        let glyph_height = custom.image.height();
+        if glyph_width == 0 || glyph_height == 0 {
+            return (GlyphAllocation::default(), h_pos.round() as i32);
+        }
+
+        let entry = match self.glyph_alloc_cache.entry(GlyphCacheKey::new(
+            (1u64 << 32) | custom_index as u64,
+            metrics,
+            SubpixelBin::Zero,
+        )) {
+            std::collections::hash_map::Entry::Occupied(entry) => {
+                return (*entry.get(), h_pos.round() as i32);
+            }
+            std::collections::hash_map::Entry::Vacant(entry) => entry,
+        };
+
+        let glyph_pos = {
+            let (glyph_pos, atlas_image) = atlas.allocate((glyph_width, glyph_height));
+            for y in 0..glyph_height {
+                for x in 0..glyph_width {
+                    let px = glyph_pos.0 + x;
+                    let py = glyph_pos.1 + y;
+                    atlas_image[(px, py)] = custom.image[(x, y)];
+                }
+            }
+            glyph_pos
+        };
+
+        let height_points = metrics.row_height;
+        let width_points =
+            height_points * (glyph_width as f32 / glyph_height as f32).max(f32::EPSILON);
+        let advance_width_px = width_points * metrics.pixels_per_point;
+        let offset = vec2(0.0, -height_points / 1.3);
+
+        let allocation = GlyphAllocation {
+            id: skrifa::GlyphId::NOTDEF,
+            advance_width_px,
+            uv_rect: UvRect {
+                offset,
+                size: vec2(width_points, height_points),
+                min: [glyph_pos.0 as u16, glyph_pos.1 as u16],
+                max: [
+                    (glyph_pos.0 + glyph_width) as u16,
+                    (glyph_pos.1 + glyph_height) as u16,
+                ],
+            },
+            coloring: GlyphColoring::Color,
+        };
+        entry.insert(allocation);
+        (allocation, h_pos.round() as i32)
+    }
+
+    /// Allocate a color glyph from central storage in the atlas.
+    fn allocate_central_color_glyph(
+        &mut self,
+        atlas: &mut TextureAtlas,
+        metrics: &ScaledMetrics,
+        chr: char,
+        custom_data: &super::fonts::CustomGlyphData,
+        h_pos: f32,
+    ) -> (GlyphAllocation, i32) {
+        // Compute target pixel size for resolution selection
+        let target_px = (metrics.row_height * metrics.pixels_per_point).round() as u16;
+        let image = custom_data.select_image(target_px);
+        let glyph_width = image.width();
+        let glyph_height = image.height();
+        if glyph_width == 0 || glyph_height == 0 {
+            return (GlyphAllocation::default(), h_pos.round() as i32);
+        }
+
+        // Use character as cache key for central glyphs (high bit pattern to distinguish from per-face)
+        let cache_hash = (2u64 << 32) | (chr as u64);
+        let entry = match self.glyph_alloc_cache.entry(GlyphCacheKey::new(
+            cache_hash,
+            metrics,
+            SubpixelBin::Zero,
+        )) {
+            std::collections::hash_map::Entry::Occupied(entry) => {
+                return (*entry.get(), h_pos.round() as i32);
+            }
+            std::collections::hash_map::Entry::Vacant(entry) => entry,
+        };
+
+        let glyph_pos = {
+            let (glyph_pos, atlas_image) = atlas.allocate((glyph_width, glyph_height));
+            for y in 0..glyph_height {
+                for x in 0..glyph_width {
+                    let px = glyph_pos.0 + x;
+                    let py = glyph_pos.1 + y;
+                    atlas_image[(px, py)] = image[(x, y)];
+                }
+            }
+            glyph_pos
+        };
+
+        let height_points = metrics.row_height;
+        let width_points =
+            height_points * (glyph_width as f32 / glyph_height as f32).max(f32::EPSILON);
+        let advance_width_px = width_points * metrics.pixels_per_point;
+        let offset = vec2(0.0, -height_points / 1.3);
+
+        let allocation = GlyphAllocation {
+            id: skrifa::GlyphId::NOTDEF,
+            advance_width_px,
+            uv_rect: UvRect {
+                offset,
+                size: vec2(width_points, height_points),
+                min: [glyph_pos.0 as u16, glyph_pos.1 as u16],
+                max: [
+                    (glyph_pos.0 + glyph_width) as u16,
+                    (glyph_pos.1 + glyph_height) as u16,
+                ],
+            },
+            coloring: GlyphColoring::Color,
+        };
+        entry.insert(allocation);
+        (allocation, h_pos.round() as i32)
+    }
 }
 
 // TODO(emilk): rename?
@@ -642,6 +934,9 @@ pub struct Font<'a> {
     pub(super) fonts_by_id: &'a mut nohash_hasher::IntMap<FontFaceKey, FontFace>,
     pub(super) cached_family: &'a mut CachedFamily,
     pub(super) atlas: &'a mut TextureAtlas,
+
+    /// Central storage for custom color glyphs (e.g., emoji).
+    pub(super) custom_glyphs: &'a ahash::HashMap<char, super::fonts::CustomGlyphData>,
 }
 
 impl Font<'_> {
@@ -651,8 +946,55 @@ impl Font<'_> {
         }
     }
 
+    /// Register a color glyph (e.g., an emoji sprite) in the atlas.
+    ///
+    /// # Deprecated
+    ///
+    /// This method uses legacy per-FontFace storage. Prefer using
+    /// `Fonts::register_color_glyph` or `FontsImpl::register_color_glyph` instead,
+    /// which use centralized storage with O(1) registration and proper persistence
+    /// across atlas rebuilds.
+    ///
+    /// **Warning:** Glyphs registered via this method will be lost when the font
+    /// atlas is rebuilt (e.g., when it fills up). Use the recommended methods
+    /// above for glyphs that should persist.
+    #[deprecated(
+        since = "0.33.0",
+        note = "Use Fonts::register_color_glyph or FontsImpl::register_color_glyph instead"
+    )]
+    pub fn register_color_glyph(&mut self, c: char, image: &Arc<ColorImage>) {
+        if self.cached_family.fonts.is_empty() {
+            return;
+        }
+
+        // Check if already has a color glyph registered
+        if let Some((_, glyph_info)) = self.cached_family.glyph_info_cache.get(&c)
+            && matches!(glyph_info.coloring, GlyphColoring::Color)
+        {
+            return; // Already has color sprite
+        }
+
+        let font_key = self.cached_family.fonts[0];
+        if let Some(font_impl) = self.fonts_by_id.get_mut(&font_key) {
+            let glyph_info = font_impl.allocate_custom_glyph_arc(c, image);
+            self.cached_family
+                .glyph_info_cache
+                .insert(c, (font_key, glyph_info));
+            self.cached_family.characters = None;
+        }
+    }
+
     /// All supported characters, and in which font they are available in.
+    ///
+    /// Returns a map from character to the list of font names that support it.
+    /// Centrally-registered custom glyphs (e.g., emoji) appear with an empty
+    /// font list since they are not tied to any specific font file.
+    #[expect(
+        clippy::iter_over_hash_type,
+        reason = "order doesn't matter, result is sorted BTreeMap"
+    )]
     pub fn characters(&mut self) -> &BTreeMap<char, Vec<String>> {
+        let custom_glyphs = self.custom_glyphs;
         self.cached_family.characters.get_or_insert_with(|| {
             let mut characters: BTreeMap<char, Vec<String>> = Default::default();
             for font_id in &self.cached_family.fonts {
@@ -660,6 +1002,10 @@ impl Font<'_> {
                 for chr in font.characters() {
                     characters.entry(chr).or_default().push(font.name.clone());
                 }
+            }
+            // Include centrally-registered custom glyphs (e.g., emoji)
+            for &chr in custom_glyphs.keys() {
+                characters.entry(chr).or_default();
             }
             characters
         })
@@ -678,7 +1024,7 @@ impl Font<'_> {
     pub fn glyph_width(&mut self, c: char, font_size: f32) -> f32 {
         let (key, glyph_info) = self.glyph_info(c);
         if let Some(font) = &self.fonts_by_id.get(&key) {
-            glyph_info.advance_width_unscaled.0 * font.font.px_scale_factor(font_size)
+            font.glyph_width_points(&glyph_info, font_size)
         } else {
             0.0
         }
@@ -698,6 +1044,27 @@ impl Font<'_> {
     pub(crate) fn glyph_info(&mut self, c: char) -> (FontFaceKey, GlyphInfo) {
         if let Some(font_index_glyph_info) = self.cached_family.glyph_info_cache.get(&c) {
             return *font_index_glyph_info;
+        }
+
+        // Check central custom glyph storage first (e.g., color emoji)
+        if let Some(custom_data) = self.custom_glyphs.get(&c) {
+            let font_key = self
+                .cached_family
+                .fonts
+                .first()
+                .copied()
+                .unwrap_or(FontFaceKey::INVALID);
+            let glyph_info = GlyphInfo {
+                id: None,
+                advance_width_unscaled: OrderedFloat(
+                    CUSTOM_GLYPH_UPEM * custom_data.aspect_ratio(),
+                ),
+                custom_glyph: None, // Not using per-face index for central storage
+                coloring: GlyphColoring::Color,
+            };
+            let result = (font_key, glyph_info);
+            self.cached_family.glyph_info_cache.insert(c, result);
+            return result;
         }
 
         let font_index_glyph_info = self

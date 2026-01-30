@@ -543,6 +543,14 @@ impl CachedFamily {
 pub struct Fonts {
     pub fonts: FontsImpl,
     galley_cache: GalleyCache,
+
+    /// Registered color glyphs that should survive atlas recreation.
+    ///
+    /// When the font atlas is rebuilt (e.g., when it gets too full),
+    /// these glyphs are re-registered automatically.
+    ///
+    /// Each entry is (character, resolutions) where resolutions is Vec<(`size_px`, image)>.
+    color_glyphs: BTreeMap<char, Vec<(u16, Arc<crate::ColorImage>)>>,
 }
 
 impl Fonts {
@@ -552,6 +560,7 @@ impl Fonts {
         Self {
             fonts: FontsImpl::new(options, definitions),
             galley_cache: Default::default(),
+            color_glyphs: BTreeMap::new(),
         }
     }
 
@@ -568,11 +577,18 @@ impl Fonts {
 
         if needs_recreate {
             let definitions = self.fonts.definitions.clone();
+            let color_glyphs = std::mem::take(&mut self.color_glyphs);
 
             *self = Self {
                 fonts: FontsImpl::new(options, definitions),
                 galley_cache: Default::default(),
+                color_glyphs: BTreeMap::new(),
             };
+
+            // Re-register color glyphs after recreation (with all resolutions)
+            for (chr, images) in color_glyphs {
+                self.register_color_glyph_multi(chr, images);
+            }
         }
 
         self.galley_cache.flush_cache();
@@ -640,6 +656,38 @@ impl Fonts {
             galley_cache: &mut self.galley_cache,
             pixels_per_point,
         }
+    }
+
+    /// Register a color glyph (e.g., an emoji sprite) for a character.
+    ///
+    /// The image will be used instead of the font's glyph for this character.
+    /// Color glyphs bypass text tinting and render with their original colors.
+    ///
+    /// The glyph will be preserved across font atlas rebuilds.
+    pub fn register_color_glyph(&mut self, character: char, image: &Arc<crate::ColorImage>) {
+        let size_px = image.height() as u16;
+        let images = vec![(size_px, Arc::clone(image))];
+        self.register_color_glyph_multi(character, images);
+    }
+
+    /// Register a color glyph with multiple resolutions for sharp rendering at all sizes.
+    ///
+    /// Each entry is (`size_px`, image) where `size_px` is the native pixel height.
+    /// The system will select the best resolution based on the target render size.
+    ///
+    /// The glyphs will be preserved across font atlas rebuilds.
+    pub fn register_color_glyph_multi(
+        &mut self,
+        character: char,
+        images: Vec<(u16, Arc<crate::ColorImage>)>,
+    ) {
+        if images.is_empty() {
+            return;
+        }
+        // Store for persistence across atlas rebuilds
+        self.color_glyphs.insert(character, images.clone());
+        // Register in the current fonts
+        self.fonts.register_color_glyph_multi(character, images);
     }
 }
 
@@ -794,6 +842,103 @@ pub struct FontsImpl {
     fonts_by_id: nohash_hasher::IntMap<FontFaceKey, FontFace>,
     fonts_by_name: ahash::HashMap<String, FontFaceKey>,
     family_cache: ahash::HashMap<FontFamily, CachedFamily>,
+
+    /// Central storage for custom color glyphs (e.g., emoji sprites).
+    ///
+    /// Stored here rather than per-FontFace to avoid duplication and enable O(1) registration.
+    custom_glyphs: ahash::HashMap<char, CustomGlyphData>,
+}
+
+/// A single resolution image for a custom glyph.
+#[derive(Clone)]
+pub(crate) struct GlyphResolution {
+    /// The native pixel height of this image.
+    pub size_px: u16,
+
+    /// The image data.
+    pub image: std::sync::Arc<crate::ColorImage>,
+}
+
+/// Data for a custom color glyph stored in central storage.
+///
+/// Supports multiple resolutions for better rendering at different sizes.
+/// When a glyph is allocated, the resolution closest to the target size is selected.
+#[derive(Clone)]
+pub(crate) struct CustomGlyphData {
+    /// Available resolutions, sorted by size (smallest first).
+    resolutions: Vec<GlyphResolution>,
+
+    /// Aspect ratio (width/height) for advance width calculation.
+    aspect_ratio: f32,
+}
+
+impl CustomGlyphData {
+    /// Create from a single image (backwards compatible).
+    pub(crate) fn from_single(image: std::sync::Arc<crate::ColorImage>) -> Self {
+        let aspect_ratio = if image.height() > 0 && image.width() > 0 {
+            image.width() as f32 / image.height() as f32
+        } else {
+            0.0
+        };
+        let size_px = image.height() as u16;
+        Self {
+            resolutions: vec![GlyphResolution { size_px, image }],
+            aspect_ratio,
+        }
+    }
+
+    /// Create from multiple resolutions.
+    ///
+    /// Each entry is (`size_px`, image). The images should all have the same aspect ratio.
+    pub(crate) fn from_multi(images: Vec<(u16, std::sync::Arc<crate::ColorImage>)>) -> Self {
+        let aspect_ratio = images
+            .first()
+            .map(|(_, img)| {
+                if img.height() > 0 && img.width() > 0 {
+                    img.width() as f32 / img.height() as f32
+                } else {
+                    0.0
+                }
+            })
+            .unwrap_or(0.0);
+
+        let mut resolutions: Vec<GlyphResolution> = images
+            .into_iter()
+            .map(|(size_px, image)| GlyphResolution { size_px, image })
+            .collect();
+        resolutions.sort_by_key(|r| r.size_px);
+
+        Self {
+            resolutions,
+            aspect_ratio,
+        }
+    }
+
+    /// Select the best resolution image for the given target pixel size.
+    ///
+    /// Selection policy:
+    /// - Use smallest resolution >= target size (prefer downscaling)
+    /// - If none larger, use the largest available (minimize upscaling)
+    #[inline]
+    pub(crate) fn select_image(&self, target_px: u16) -> &std::sync::Arc<crate::ColorImage> {
+        // Find smallest resolution that's >= target (prefer slight downscale over upscale)
+        for res in &self.resolutions {
+            if res.size_px >= target_px {
+                return &res.image;
+            }
+        }
+        // All resolutions are smaller than target; use largest to minimize upscaling
+        self.resolutions
+            .last()
+            .map(|r| &r.image)
+            .unwrap_or_else(|| &self.resolutions[0].image)
+    }
+
+    /// Returns the aspect ratio (width/height) for advance width calculation.
+    #[inline]
+    pub(crate) fn aspect_ratio(&self) -> f32 {
+        self.aspect_ratio
+    }
 }
 
 impl FontsImpl {
@@ -829,6 +974,7 @@ impl FontsImpl {
             fonts_by_id,
             fonts_by_name,
             family_cache: Default::default(),
+            custom_glyphs: Default::default(),
         }
     }
 
@@ -859,6 +1005,72 @@ impl FontsImpl {
             fonts_by_id: &mut self.fonts_by_id,
             cached_family,
             atlas: &mut self.atlas,
+            custom_glyphs: &self.custom_glyphs,
+        }
+    }
+
+    /// Register a color glyph (e.g., an emoji sprite) for a character.
+    ///
+    /// The glyph is stored centrally and available to all font families.
+    /// This is O(1) per glyph, regardless of how many fonts are loaded.
+    pub fn register_color_glyph(
+        &mut self,
+        character: char,
+        image: &std::sync::Arc<crate::ColorImage>,
+    ) {
+        // Check if this is a re-registration (character already exists)
+        let is_update = self.custom_glyphs.contains_key(&character);
+
+        // Store in central storage using single-resolution wrapper
+        self.custom_glyphs.insert(
+            character,
+            CustomGlyphData::from_single(std::sync::Arc::clone(image)),
+        );
+
+        self.invalidate_glyph_caches(character, is_update);
+    }
+
+    /// Register a color glyph with multiple resolutions for better rendering at different sizes.
+    ///
+    /// Each entry in `images` is (`size_px`, image) where `size_px` is the native pixel height.
+    /// The system will select the best resolution based on the target render size:
+    /// - Prefer the smallest resolution >= target size (slight downscale)
+    /// - Fall back to largest resolution if all are smaller (minimize upscale)
+    ///
+    /// This enables sharp emoji rendering at all font sizes without GPU mipmaps.
+    pub fn register_color_glyph_multi(
+        &mut self,
+        character: char,
+        images: Vec<(u16, std::sync::Arc<crate::ColorImage>)>,
+    ) {
+        if images.is_empty() {
+            return;
+        }
+
+        let is_update = self.custom_glyphs.contains_key(&character);
+        self.custom_glyphs
+            .insert(character, CustomGlyphData::from_multi(images));
+        self.invalidate_glyph_caches(character, is_update);
+    }
+
+    /// Invalidate caches after glyph registration/update.
+    #[expect(
+        clippy::iter_over_hash_type,
+        reason = "order doesn't matter for cache invalidation"
+    )]
+    fn invalidate_glyph_caches(&mut self, character: char, is_update: bool) {
+        // Invalidate any cached glyph info and characters map for this character
+        for cached_family in self.family_cache.values_mut() {
+            cached_family.glyph_info_cache.remove(&character);
+            cached_family.characters = None;
+        }
+
+        // When re-registering a glyph with a new image, clear allocation caches
+        // to ensure stale atlas allocations aren't reused
+        if is_update {
+            for font_face in self.fonts_by_id.values_mut() {
+                font_face.clear_glyph_alloc_cache();
+            }
         }
     }
 }
